@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json; nb=json.load\\(open\\(r''''C:\\\\Users\\\\kevin\\\\Downloads\\\\pretraining_and_evaluation_kevin_yu.ipynb''''\\)\\); [print\\(''''''''.join\\(c[''''source'''']\\)[:200]\\) for c in nb[''''cells''''] if c[''''cell_type'''']==''''markdown'''']\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
