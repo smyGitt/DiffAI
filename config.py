@@ -4,8 +4,8 @@ from pathlib import Path
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 50257
-    context_length: int = 512
+    vocab_size: int = 50261
+    context_length: int = 1024  # GPT-2 supports up to 1024; must match DataConfig.context_length
     emb_dim: int = 256
     n_heads: int = 8
     n_layers: int = 6
@@ -15,9 +15,12 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    csv_path: Path = None
-    max_diff_tokens: int = 400
-    max_msg_tokens: int = 80
+    csv_path: Path = Path(r"F:\commitbench_long.csv")
+    # Sequence budget: diff + msg + ~8 special/newline tokens <= context_length.
+    # With context_length=1024: 900 + 100 + 8 = 1008, leaving a small safety margin.
+    context_length: int = 1024  # must match ModelConfig.context_length
+    max_diff_tokens: int = 900
+    max_msg_tokens: int = 100
     max_rows_train: int = 50_000
     max_rows_val: int = 5_000
     max_rows_test: int = 5_000

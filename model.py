@@ -1,3 +1,32 @@
+"""
+DiffGPT — autoregressive transformer for git diff explanation.
+
+The model is trained to generate natural-language commit messages from raw
+git diff text.  Each training sequence has the form:
+
+    <|diff|>
+    {raw unified diff}
+    <|endofdiff|>
+    <|msg|>
+    {commit message}
+    <|endofmsg|>
+
+Loss is computed only on the commit-message tokens; the diff prompt is masked
+out via IGNORE_INDEX so the model learns to condition on the diff and
+produce a concise explanation rather than memorising patch syntax.
+
+Two usage modes are supported:
+
+* **From scratch** — ``DiffGPT``: a compact GPT-2-style decoder trained
+  entirely on CommitBench data.
+* **Fine-tuned** — ``load_pretrained_gpt2``: loads an HuggingFace GPT-2
+  checkpoint and fine-tunes it on the same task, benefiting from the
+  pretrained language model's world knowledge.
+
+Context window: controlled by ``ModelConfig.context_length`` (default 1024),
+which must match the ``allowed_max_length`` used in ``data.collate_diff_batch``.
+"""
+
 import math
 
 import torch
@@ -122,7 +151,7 @@ class DiffGPT(nn.Module):
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
 
-            if next_id[0].item() == 50256:
+            if next_id[0].item() == 50260:  # <|endofmsg|>
                 break
 
         return idx

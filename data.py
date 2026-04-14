@@ -18,6 +18,24 @@ MSG_END = "<|endofmsg|>"
 SPECIAL_TOKENS = [DIFF_START, DIFF_END, MSG_START, MSG_END]
 
 PAD_ID = 50256
+
+_SPECIAL_TOKENS_SET = set(SPECIAL_TOKENS)
+
+
+def make_tokenizer():
+    base = tiktoken.get_encoding("gpt2")
+    return tiktoken.Encoding(
+        name="gpt2_diffai",
+        pat_str=base._pat_str,
+        mergeable_ranks=base._mergeable_ranks,
+        special_tokens={
+            **base._special_tokens,
+            DIFF_START: 50257,
+            DIFF_END: 50258,
+            MSG_START: 50259,
+            MSG_END: 50260,
+        }
+    )
 IGNORE_INDEX = -100
 
 
@@ -66,6 +84,95 @@ def load_commitbench(cfg: DataConfig) -> Tuple[List[dict], List[dict], List[dict
     return train, val, test
 
 
+def truncate_diff(diff_text: str, enc, max_tokens: int) -> str:
+    """
+    Fit a unified diff into *max_tokens* while preserving breadth over depth.
+
+    Naive head-truncation would drop every file after the first one or two,
+    giving the model no signal about the overall scope of a change.  This
+    function instead:
+
+    1. Splits the diff into per-file sections (on ``diff --git`` boundaries,
+       falling back to ``--- ``/ ``+++ `` boundaries for non-git diffs).
+    2. Separates each section into a *header* (lines before the first ``@@``
+       hunk) and *hunk body* (the actual changed lines).
+    3. Includes **all** file headers first — they are short and tell the model
+       which files changed.
+    4. Distributes the remaining token budget evenly across every file's hunk
+       body, truncating each one proportionally if needed.
+
+    The result is always within *max_tokens* and always mentions every file
+    that was touched, even if the per-file hunk content is abbreviated.
+    """
+    # Fast path: already fits.
+    if len(enc.encode(diff_text, disallowed_special=())) <= max_tokens:
+        return diff_text
+
+    lines = diff_text.splitlines(keepends=True)
+
+    # ── 1. Split into per-file sections ──────────────────────────────────────
+    file_sections: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if line.startswith("diff --git ") and current:
+            file_sections.append(current)
+            current = []
+        current.append(line)
+    if current:
+        file_sections.append(current)
+
+    # If the diff has no "diff --git" markers, treat the whole thing as one
+    # section and fall back to a plain token-level truncation.
+    if len(file_sections) == 1 and not diff_text.lstrip().startswith("diff --git "):
+        return enc.decode(enc.encode(diff_text, disallowed_special=())[:max_tokens])
+
+    # ── 2. Separate header from hunk body for each file ──────────────────────
+    # header = everything before the first "@@ " line
+    # body   = the "@@ " line and everything after it within the same file
+    file_parts: list[tuple[str, str]] = []
+    for section in file_sections:
+        header_lines: list[str] = []
+        body_lines: list[str] = []
+        in_body = False
+        for line in section:
+            if not in_body and line.startswith("@@ "):
+                in_body = True
+            if in_body:
+                body_lines.append(line)
+            else:
+                header_lines.append(line)
+        file_parts.append(("".join(header_lines), "".join(body_lines)))
+
+    # ── 3. Tokenise headers and bodies ───────────────────────────────────────
+    header_token_lists = [enc.encode(h, disallowed_special=()) for h, _ in file_parts]
+    body_token_lists   = [enc.encode(b, disallowed_special=()) for _, b in file_parts]
+
+    total_header_tokens = sum(len(t) for t in header_token_lists)
+
+    # Edge case: headers alone exceed the budget — include as many whole
+    # file headers as possible and stop.
+    if total_header_tokens >= max_tokens:
+        result: list[int] = []
+        for h_toks in header_token_lists:
+            if len(result) + len(h_toks) > max_tokens:
+                break
+            result.extend(h_toks)
+        return enc.decode(result)
+
+    # ── 4. Distribute remaining budget evenly across hunk bodies ─────────────
+    remaining = max_tokens - total_header_tokens
+    n_files   = len(file_parts)
+    per_file_budget = remaining // n_files  # integer floor is fine
+
+    parts: list[str] = []
+    for (header, _), h_toks, b_toks in zip(file_parts, header_token_lists, body_token_lists):
+        parts.append(header)
+        if b_toks:
+            parts.append(enc.decode(b_toks[:per_file_budget]))
+
+    return "".join(parts)
+
+
 def format_prompt(diff: str, message: str = "") -> str:
     text = f"{DIFF_START}\n{diff}\n{DIFF_END}\n{MSG_START}\n"
     if message:
@@ -89,19 +196,18 @@ class DiffDataset(Dataset):
 
 
 def collate_diff_batch(batch, enc, max_diff_tokens, max_msg_tokens,
-                       allowed_max_length=512, device="cpu"):
+                       allowed_max_length=1024, device="cpu"):
     input_ids_list = []
     prompt_lens = []
 
     for entry in batch:
-        diff_ids = enc.encode(entry["diff"])[:max_diff_tokens]
-        truncated_diff = enc.decode(diff_ids)
+        truncated_diff = truncate_diff(entry["diff"], enc, max_diff_tokens)
 
         prompt = format_prompt_only(truncated_diff)
-        prompt_ids = enc.encode(prompt)
+        prompt_ids = enc.encode(prompt, allowed_special=_SPECIAL_TOKENS_SET)
 
-        msg_ids = enc.encode(entry["message"])[:max_msg_tokens]
-        end_ids = enc.encode("\n" + MSG_END)
+        msg_ids = enc.encode(entry["message"], disallowed_special=())[:max_msg_tokens]
+        end_ids = enc.encode("\n" + MSG_END, allowed_special=_SPECIAL_TOKENS_SET)
 
         full_ids = prompt_ids + msg_ids + end_ids
         full_ids = full_ids[:allowed_max_length - 1] + [PAD_ID]
@@ -152,6 +258,7 @@ def build_loaders(train_data, val_data, test_data, enc, cfg: DataConfig,
     collate = partial(collate_diff_batch, enc=enc,
                       max_diff_tokens=cfg.max_diff_tokens,
                       max_msg_tokens=cfg.max_msg_tokens,
+                      allowed_max_length=cfg.context_length,
                       device=device)
 
     train_ds = DiffDataset(train_data)

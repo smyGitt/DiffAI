@@ -1,9 +1,7 @@
 import sys
 import torch
-import tiktoken
-
-from config import ModelConfig, TrainConfig
-from data import format_prompt_only, MSG_END
+from config import ModelConfig, DataConfig, TrainConfig
+from data import format_prompt_only, truncate_diff, MSG_END, SPECIAL_TOKENS, make_tokenizer
 from model import DiffGPT, load_pretrained_gpt2
 
 
@@ -11,8 +9,10 @@ def generate_description(model, enc, diff_text, device="cpu",
                          max_new_tokens=80, temperature=0.7, top_k=50,
                          use_pretrained=False):
     model.eval()
+    dcfg = DataConfig()
+    diff_text = truncate_diff(diff_text, enc, dcfg.max_diff_tokens)
     prompt = format_prompt_only(diff_text)
-    prompt_ids = enc.encode(prompt)
+    prompt_ids = enc.encode(prompt, allowed_special=set(SPECIAL_TOKENS))
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
     if use_pretrained:
@@ -23,6 +23,7 @@ def generate_description(model, enc, diff_text, device="cpu",
             temperature=temperature,
             top_k=top_k,
             pad_token_id=enc.eot_token,
+            eos_token_id=50260,  # <|endofmsg|>
         )
         generated = enc.decode(out[0].tolist())
     else:
@@ -51,13 +52,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     mcfg = ModelConfig()
     tcfg = TrainConfig()
-    enc = tiktoken.get_encoding("gpt2")
+    enc = make_tokenizer()
 
     checkpoint = tcfg.checkpoint_dir / "diffai_final.pt"
 
     if tcfg.use_pretrained:
         print(f"Loading pretrained {tcfg.pretrained_model}...")
         model = load_pretrained_gpt2(mcfg, tcfg.pretrained_model).to(device)
+        model.resize_token_embeddings(enc.n_vocab)
         model.load_state_dict(torch.load(checkpoint, map_location=device))
         use_pretrained = True
     else:
